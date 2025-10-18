@@ -1,18 +1,23 @@
 import rtmidi
 import time
 import sys
+import argparse
+import configparser
 from threading import Lock
 
-# --- Configuration ---
-MIDI_PORT_1_KEYWORD = "Standard MIDI"  # Change to a unique part of your standard MIDI device name
-MIDI_PORT_2_KEYWORD = "CQ18T"          # Change to a unique part of your CQ18T MIDI device name
-# ---------------------
-
+# --- Constants ---
 # MIDI Note Names for conversion
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 # Lock for thread-safe printing/logging
 print_lock = Lock()
+# Global variables for configuration and logging
+CONFIG = {}
+LOG_FILE = None
+VERBOSE = False
+VERY_VERBOSE = False
+
+# --- Utility Functions ---
 
 def get_note_name(note_number):
     """Converts a MIDI note number (0-127) to a note name (e.g., C3)."""
@@ -22,63 +27,67 @@ def get_note_name(note_number):
         return f"{note}{octave}"
     return "???"
 
-def parse_midi_message_1(message, time_stamp):
-    """Parses and formats standard MIDI messages from the first interface."""
-    midi_data = message[0]
-    # Status byte is the first byte of the MIDI message
-    status = midi_data[0]
+def log_message(interface_id, output_line, raw_data=None):
+    """Handles logging and console output based on verbosity levels."""
     
-    # Extract channel (0-15) - status bytes 0x80 to 0xE0 are channel messages
-    channel = (status & 0x0F) + 1
-    
-    # Message type (High 4 bits of the status byte)
-    msg_type = status & 0xF0
+    # 1. Write to log file
+    if LOG_FILE:
+        with open(LOG_FILE, 'a') as f:
+            f.write(f"[{interface_id}] {output_line}\n")
+            
+    # 2. Console output (Verbose mode)
+    if VERBOSE:
+        with print_lock:
+            print(f"[{interface_id}] {output_line}")
+            
+    # 3. Console output (Very Verbose mode - raw data)
+    if VERY_VERBOSE and raw_data is not None:
+        hex_data = ' '.join(f'{b:02X}' for b in raw_data)
+        with print_lock:
+            print(f"[{interface_id}] RAW: {hex_data}")
 
-    output_line = None
+
+# --- MIDI Parsing Callbacks ---
+
+def parse_midi_message_1(message, time_stamp):
+    """Callback for standard MIDI messages (Interface 1)."""
     
-    # Timecode formatting (seconds elapsed since port was opened)
+    midi_data = message[0]
+    status = midi_data[0]
+    msg_type = status & 0xF0
+    output_line = None
     timecode = f"{time_stamp:.4f}"
 
     if 0x80 <= msg_type <= 0x90 and len(midi_data) >= 3:
-        # Note Off (0x80) or Note On (0x90)
         note_number = midi_data[1]
         velocity = midi_data[2]
         note_name = get_note_name(note_number)
         
         if msg_type == 0x80 or (msg_type == 0x90 and velocity == 0):
-            # 0x80 is Note Off. 0x90 with velocity 0 is also Note Off.
             output_line = f"{timecode} Note Off {note_name} <{velocity}>"
         elif msg_type == 0x90:
             output_line = f"{timecode} Note On {note_name} <{velocity}>"
 
     elif msg_type == 0xB0 and len(midi_data) >= 3:
-        # Control Change (CC)
         cc_number = midi_data[1]
         value = midi_data[2]
-        # Check for standard Start/Stop/Continue System Real Time messages
-        if cc_number == 0x79: # Unassigned (most likely a CC)
-             output_line = f"{timecode} CC {cc_number} <{value}>"
-        else:
-             output_line = f"{timecode} CC {cc_number} <{value}>"
-
+        output_line = f"{timecode} CC {cc_number} <{value}>"
 
     elif msg_type == 0xC0 and len(midi_data) >= 2:
-        # Program Change (PC)
         pc_value = midi_data[1]
         output_line = f"{timecode} PC <{pc_value}>"
 
     elif msg_type == 0xE0 and len(midi_data) >= 3:
-        # Pitch Bend Change
         lsb = midi_data[1]
         msb = midi_data[2]
         pitch_value = (msb << 7) | lsb
-        # Range is 0 to 16383. Center is 8192.
         output_line = f"{timecode} Pitch Bend <{pitch_value}>"
         
     elif status == 0xF0:
-        # System Exclusive (Sysex) - Starts with 0xF0 and ends with 0xF7
-        hex_data = ' '.join(f'{b:02X}' for b in midi_data)
-        output_line = f"{timecode} Sysex {hex_data}"
+        # System Exclusive
+        if CONFIG.get('record_sysex', True):
+            hex_data = ' '.join(f'{b:02X}' for b in midi_data)
+            output_line = f"{timecode} Sysex {hex_data}"
         
     elif status == 0xFA:
         output_line = f"{timecode} Start"
@@ -87,43 +96,34 @@ def parse_midi_message_1(message, time_stamp):
     elif status == 0xFC:
         output_line = f"{timecode} Stop"
     elif status == 0xF8:
-        # MIDI Clock - often filtered, but if not, log it quietly
-        pass # output_line = f"{timecode} Clock" 
+        # MIDI Clock
+        if CONFIG.get('record_midi_clock', False):
+            output_line = f"{timecode} Clock" 
     elif status == 0xFE:
-        # Active Sensing - often filtered, but if not, log it quietly
-        pass # output_line = f"{timecode} Active Sensing"
+        # Active Sensing
+        if CONFIG.get('record_active_sensing', False):
+            output_line = f"{timecode} Active Sensing"
     
-    # Fallback for unparsed messages
+    # Fallback/Unparsed Message
     if output_line is None:
         hex_data = ' '.join(f'{b:02X}' for b in midi_data)
         output_line = f"{timecode} Unknown MIDI Message: {hex_data}"
 
-    with print_lock:
-        print(f"[IFACE 1] {output_line}")
+    if output_line:
+        log_message("IFACE 1", output_line, midi_data)
+
 
 def parse_midi_message_2(message, time_stamp):
-    """
-    Parses and formats custom CQ18T NRPN messages from the second interface.
+    """Callback for CQ18T custom messages (Interface 2)."""
     
-    The CQ18T messages are essentially multiple Control Change messages grouped
-    together, forming an NRPN sequence (CC99/CC98 for parameter address, CC6/CC38 for value).
-    
-    - 9 bytes (Mute Toggle): B0 63 <ch_msb> B0 62 <ch_lsb> B0 60 00
-    - 12 bytes (Mute On/Off): B0 63 <ch_msb> B0 62 <ch_lsb> B0 06 00 B0 26 <on/off>
-    - 12 bytes (Level): B0 63 <ch_msb> B0 62 <ch_lsb> B0 06 <val_msb> B0 26 <val_lsb>
-    """
     midi_data = message[0]
     length = len(midi_data)
     output_line = None
     timecode = f"{time_stamp:.4f}"
     
-    # Function to get channel number from MSB/LSB (example: 0x00 0x00 could be Chan 1)
-    # The actual mapping of MSB/LSB to a specific channel/parameter is complex (NRPN address).
-    # We will log the MSB/LSB for clarity, as the exact channel map isn't provided.
-    
     try:
         if length == 9:
-            # Expected pattern: B0 63 MSB B0 62 LSB B0 60 00
+            # 9 bytes: Mute Toggle (B0 63 MSB B0 62 LSB B0 60 00)
             if (midi_data[0] == 0xB0 and midi_data[1] == 0x63 and 
                 midi_data[3] == 0xB0 and midi_data[4] == 0x62 and 
                 midi_data[6] == 0xB0 and midi_data[7] == 0x60 and midi_data[8] == 0x00):
@@ -134,7 +134,7 @@ def parse_midi_message_2(message, time_stamp):
                                f"Address (CC99/98): {ch_msb:02X}/{ch_lsb:02X}")
 
         elif length == 12:
-            # Expected pattern: B0 63 MSB B0 62 LSB B0 06 D_MSB B0 26 D_LSB
+            # 12 bytes: Mute On/Off or Level
             if (midi_data[0] == 0xB0 and midi_data[1] == 0x63 and 
                 midi_data[3] == 0xB0 and midi_data[4] == 0x62 and 
                 midi_data[6] == 0xB0 and 
@@ -145,50 +145,46 @@ def parse_midi_message_2(message, time_stamp):
                 data_msb = midi_data[7]
                 data_lsb = midi_data[10]
                 
-                # Mute On/Off
-                if data_msb == 0x00:
-                    if data_lsb == 0x01:
-                        output_line = (f"{timecode} CQ18T Mute On "
-                                       f"Address (CC99/98): {ch_msb:02X}/{ch_lsb:02X}")
-                    elif data_lsb == 0x00:
-                        output_line = (f"{timecode} CQ18T Mute Off "
-                                       f"Address (CC99/98): {ch_msb:02X}/{ch_lsb:02X}")
-                    else:
-                        # Fallback for unexpected 12-byte with D_MSB=00
-                        pass
+                if data_msb == 0x00: # Mute On/Off
+                    action = "Mute On" if data_lsb == 0x01 else ("Mute Off" if data_lsb == 0x00 else "Unknown Mute Value")
+                    output_line = (f"{timecode} CQ18T {action} "
+                                   f"Address (CC99/98): {ch_msb:02X}/{ch_lsb:02X}")
                 
-                # Level/Fader
-                else:
-                    # Value is 14-bit: (data_msb * 128) + data_lsb
+                else: # Level/Fader
                     level_value = (data_msb << 7) | data_lsb
                     output_line = (f"{timecode} CQ18T Level (NRPN Data) <{level_value}> "
                                    f"Address (CC99/98): {ch_msb:02X}/{ch_lsb:02X} "
                                    f"Raw Value (CC6/38): {data_msb:02X}/{data_lsb:02X}")
 
+        # Unrecognized Sysex/Real-Time (though these should be filtered by rtmidi ignore_types)
+        elif status == 0xF0 and CONFIG.get('record_sysex', True):
+            hex_data = ' '.join(f'{b:02X}' for b in midi_data)
+            output_line = f"{timecode} Sysex {hex_data}"
+            
         # Fallback for unparsed messages
         if output_line is None:
             hex_data = ' '.join(f'{b:02X}' for b in midi_data)
             output_line = f"{timecode} CQ18T Unrecognized ({length} bytes): {hex_data}"
     
     except IndexError:
-        # Catches messages shorter than expected if they partially match a condition
         hex_data = ' '.join(f'{b:02X}' for b in midi_data)
         output_line = f"{timecode} CQ18T Incomplete/Bad Message: {hex_data}"
     
-    with print_lock:
-        print(f"[IFACE 2] {output_line}")
+    if output_line:
+        log_message("IFACE 2", output_line, midi_data)
 
+
+# --- Port Selection and Main Logic ---
 
 def select_port(midiin, keyword):
     """Allows user to select a port based on a keyword."""
     ports = midiin.get_ports()
     if not ports:
-        print("No MIDI input ports found.")
+        print("❌ No MIDI input ports found.")
         return None
 
     print(f"\nAvailable MIDI input ports (Search Keyword: '{keyword}'):")
     
-    # Try to auto-select
     selected_port = -1
     for i, port in enumerate(ports):
         print(f"  [{i}] {port}")
@@ -212,12 +208,79 @@ def select_port(midiin, keyword):
         except ValueError:
             print("Invalid input. Please enter a number.")
 
+def list_ports():
+    """Prints a list of all available MIDI input ports."""
+    midiin = rtmidi.MidiIn()
+    ports = midiin.get_ports()
+    if not ports:
+        print("No MIDI input ports found.")
+        return
+
+    print("\n--- Available MIDI Input Ports ---")
+    for i, port in enumerate(ports):
+        print(f"  [{i}] {port}")
+    print("----------------------------------\n")
+    sys.exit(0)
+
+def load_config(config_file):
+    """Loads configuration from the specified file."""
+    config = configparser.ConfigParser()
+    try:
+        config.read(config_file)
+    except Exception as e:
+        print(f"❌ Error reading configuration file '{config_file}': {e}")
+        sys.exit(1)
+
+    global CONFIG
+    
+    # Load Ports
+    CONFIG['interface_1_keyword'] = config.get('PORTS', 'interface_1_keyword', fallback='Standard MIDI')
+    CONFIG['interface_2_keyword'] = config.get('PORTS', 'interface_2_keyword', fallback='CQ18T')
+
+    # Load Filters and convert to boolean
+    CONFIG['record_midi_clock'] = config.getboolean('FILTERS', 'record_midi_clock', fallback=False)
+    CONFIG['record_active_sensing'] = config.getboolean('FILTERS', 'record_active_sensing', fallback=False)
+    # The rtmidi default is to filter sysex, we explicitly invert the setting here
+    CONFIG['record_sysex'] = config.getboolean('FILTERS', 'record_sysex', fallback=True)
+    
+    print(f"Configuration loaded from {config_file}.")
+
+
 def main():
     """Main function to initialize and run the MIDI recorder."""
+    
+    # 1. Argument Parsing
+    parser = argparse.ArgumentParser(description="Two-Interface MIDI Traffic Recorder with custom parsing.")
+    parser.add_argument('-c', '--config', type=str, default='config.ini',
+                        help="Specify the configuration file (default: config.ini).")
+    parser.add_argument('-l', '--log', type=str,
+                        help="Specify the filename/path for the MIDI record file. If omitted, no file is written.")
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help="Enable verbose mode: display all received messages as formatted text (as they are logged).")
+    parser.add_argument('-vv', '--very-verbose', action='store_true',
+                        help="Enable very verbose mode: display formatted text AND raw hexadecimal data for all messages.")
+    parser.add_argument('-p', '--ports', action='store_true',
+                        help="List all available MIDI Input ports and exit.")
+    
+    args = parser.parse_args()
+
+    if args.ports:
+        list_ports()
+        
+    # Set global options
+    global LOG_FILE, VERBOSE, VERY_VERBOSE
+    LOG_FILE = args.log
+    VERBOSE = args.verbose
+    VERY_VERBOSE = args.very_verbose
+    
+    # Load configuration
+    load_config(args.config)
+
+    # --- Initialise MIDI ---
     midiin = rtmidi.MidiIn()
     
     # --- Port 1 Setup (Standard MIDI) ---
-    port_1_index = select_port(midiin, MIDI_PORT_1_KEYWORD)
+    port_1_index = select_port(midiin, CONFIG['interface_1_keyword'])
     if port_1_index is None:
         sys.exit(1)
 
@@ -225,27 +288,36 @@ def main():
     midi_in_1 = rtmidi.MidiIn()
     midi_in_1.open_port(port_1_index)
     
-    # Enable Sysex, Clock, and Active Sensing for comprehensive logging
-    midi_in_1.ignore_types(False, False, False)
+    # rtmidi.ignore_types(sysex, midi_clock, active_sensing)
+    # We invert the config logic here because ignore_types expects a boolean for 'ignore'
+    ignore_sysex = not CONFIG['record_sysex']
+    ignore_clock = not CONFIG['record_midi_clock']
+    ignore_sense = not CONFIG['record_active_sensing']
+    
+    midi_in_1.ignore_types(ignore_sysex, ignore_clock, ignore_sense)
     midi_in_1.set_callback(parse_midi_message_1)
     
-    print(f"\n[OK] Opened Interface 1: {port_1_name}. Recording standard MIDI traffic.")
+    print(f"\n✅ Opened Interface 1: {port_1_name}. Recording standard MIDI traffic.")
 
     # --- Port 2 Setup (CQ18T) ---
-    port_2_index = select_port(midiin, MIDI_PORT_2_KEYWORD)
+    port_2_index = select_port(midiin, CONFIG['interface_2_keyword'])
     if port_2_index is None:
         sys.exit(1)
         
     port_2_name = midiin.get_port_name(port_2_index)
-    # Note: A new MidiIn instance is required for a separate port
     midi_in_2 = rtmidi.MidiIn() 
     midi_in_2.open_port(port_2_index)
     
-    # We ignore standard Real-Time messages on this port too, but enable Sysex
-    midi_in_2.ignore_types(False, False, False)
+    midi_in_2.ignore_types(ignore_sysex, ignore_clock, ignore_sense)
     midi_in_2.set_callback(parse_midi_message_2)
     
-    print(f"[OK] Opened Interface 2: {port_2_name}. Recording CQ18T custom messages.")
+    print(f"✅ Opened Interface 2: {port_2_name}. Recording CQ18T custom messages.")
+    
+    if LOG_FILE:
+        print(f"📝 Logging to file: {LOG_FILE}")
+        
+    if VERBOSE or VERY_VERBOSE:
+        print("👀 Verbose logging ENABLED.")
     
     print("\n--- MIDI Recording Started (Press Ctrl+C to stop) ---")
 
@@ -265,3 +337,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
+ 

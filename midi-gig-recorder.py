@@ -251,20 +251,20 @@ def main():
     
     # 1. Argument Parsing
     parser = argparse.ArgumentParser(description="Two-Interface MIDI Traffic Recorder with custom parsing.")
-    parser.add_argument('-c', '--config', type=str, default='config.ini',
-                        help="Specify the configuration file (default: config.ini).")
+    parser.add_argument('-c', '--config', type=str, default='recorder.ini',
+                        help="Specify the configuration file (default: recorder.ini).")
     parser.add_argument('-l', '--log', type=str,
                         help="Specify the filename/path for the MIDI record file. If omitted, no file is written.")
     parser.add_argument('-v', '--verbose', action='store_true',
                         help="Enable verbose mode: display all received messages as formatted text (as they are logged).")
     parser.add_argument('-vv', '--very-verbose', action='store_true',
                         help="Enable very verbose mode: display formatted text AND raw hexadecimal data for all messages.")
-    parser.add_argument('-p', '--ports', action='store_true',
+    parser.add_argument('-p', '--list', action='store_true',
                         help="List all available MIDI Input ports and exit.")
     
     args = parser.parse_args()
 
-    if args.ports:
+    if args.list:
         list_ports()
         
     # Set global options
